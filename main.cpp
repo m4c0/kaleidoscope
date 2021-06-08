@@ -1,5 +1,11 @@
 #include <cctype>
 #include <iostream>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/LegacyPassManager.h>
+#include <llvm/IR/Value.h>
+#include <llvm/IR/Verifier.h>
+#include <llvm/Transforms/IPO.h>
+#include <llvm/Transforms/IPO/PassManagerBuilder.h>
 #include <map>
 #include <memory>
 #include <string>
@@ -43,6 +49,8 @@ namespace k {
         num_str += last_char;
         last_char = getchar();
       } while (std::isdigit(last_char) || last_char == '.');
+
+      num_val = strtod(num_str.c_str(), nullptr);
       return tok_number;
     }
 
@@ -73,6 +81,7 @@ namespace k::ast {
   class expr {
   public:
     virtual ~expr() = default;
+    virtual llvm::Value * codegen() = 0;
   };
 
   class number_expr : public expr {
@@ -81,6 +90,7 @@ namespace k::ast {
   public:
     explicit number_expr(double val) : m_val(val) {
     }
+    virtual llvm::Value * codegen();
   };
 
   class var_expr : public expr {
@@ -89,6 +99,7 @@ namespace k::ast {
   public:
     explicit var_expr(const std::string & name) : m_name(name) {
     }
+    virtual llvm::Value * codegen();
   };
 
   class binary_expr : public expr {
@@ -101,6 +112,7 @@ namespace k::ast {
       , m_lhs(std::move(lhs))
       , m_rhs(std::move(rhs)) {
     }
+    virtual llvm::Value * codegen();
   };
 
   class call_expr : public expr {
@@ -112,6 +124,7 @@ namespace k::ast {
       : m_callee(callee)
       , m_args(std::move(args)) {
     }
+    virtual llvm::Value * codegen();
   };
 
   class prototype {
@@ -125,6 +138,7 @@ namespace k::ast {
     [[nodiscard]] constexpr const auto & name() const {
       return m_name;
     }
+    virtual llvm::Function * codegen();
   };
 
   class function {
@@ -136,9 +150,11 @@ namespace k::ast {
       : m_proto(std::move(proto))
       , m_body(std::move(body)) {
     }
+    virtual llvm::Function * codegen();
   };
 
   static std::unique_ptr<expr> log_error(const char * str) {
+    std::cerr << str << "\n";
     return nullptr;
   }
   static std::unique_ptr<prototype> log_error_p(const char * str) {
@@ -289,22 +305,32 @@ namespace k::ast {
   }
 
   static void handle_definition() {
-    if (parse_definition()) {
-      std::cerr << "def\n";
+    if (auto fn = parse_definition()) {
+      if (auto ir = fn->codegen()) {
+        ir->print(llvm::errs());
+        std::cerr << "\n";
+      }
     } else {
       get_next_token();
     }
   }
   static void handle_extern() {
-    if (parse_extern()) {
-      std::cerr << "extern\n";
+    if (auto fn = parse_extern()) {
+      if (auto ir = fn->codegen()) {
+        ir->print(llvm::errs());
+        std::cerr << "\n";
+      }
     } else {
       get_next_token();
     }
   }
   static void handle_top_level_expr() {
-    if (parse_top_level_expr()) {
-      std::cerr << "top level\n";
+    if (auto e = parse_top_level_expr()) {
+      if (auto ir = e->codegen()) {
+        ir->print(llvm::errs());
+        std::cerr << "\n";
+        ir->eraseFromParent();
+      }
     } else {
       get_next_token();
     }
@@ -334,7 +360,122 @@ namespace k::ast {
     }
   }
 }
+namespace k::cgen {
+  static llvm::LLVMContext ctx {};
+  static llvm::IRBuilder<> builder { ctx };
+  static llvm::Module mod { "k jit", ctx };
+  static llvm::legacy::PassManager pm;
+  static llvm::legacy::FunctionPassManager fpm { &mod };
+  static std::map<std::string, llvm::Value *> scope;
+
+  static llvm::Function * log_error_f(const char * str) {
+    std::cerr << str << "\n";
+    return nullptr;
+  }
+  static llvm::Value * log_error_v(const char * str) {
+    std::cerr << str << "\n";
+    return nullptr;
+  }
+
+  static void setup_fpm() {
+    llvm::PassManagerBuilder b;
+    b.OptLevel = 3;
+    b.SizeLevel = 0;
+    b.Inliner = llvm::createFunctionInliningPass(3, 0, false);
+    b.populateFunctionPassManager(fpm);
+    b.populateModulePassManager(pm);
+
+    pm.add(llvm::createVerifierPass());
+    fpm.doInitialization();
+  }
+}
+
+llvm::Value * k::ast::number_expr::codegen() {
+  return llvm::ConstantFP::get(k::cgen::ctx, llvm::APFloat(m_val));
+}
+llvm::Value * k::ast::var_expr::codegen() {
+  auto it = k::cgen::scope.find(m_name);
+  if (it == k::cgen::scope.end()) {
+    return k::cgen::log_error_v("unknown variable name");
+  }
+  return it->second;
+}
+llvm::Value * k::ast::binary_expr::codegen() {
+  auto * l = m_lhs->codegen();
+  auto * r = m_rhs->codegen();
+  if (!l || !r) return nullptr;
+
+  switch (m_op) {
+  case '+':
+    return k::cgen::builder.CreateFAdd(l, r, "addtmp");
+  case '-':
+    return k::cgen::builder.CreateFSub(l, r, "subtmp");
+  case '*':
+    return k::cgen::builder.CreateFMul(l, r, "multmp");
+  case '<': {
+    auto * c = k::cgen::builder.CreateFCmpULT(l, r, "cmptmp");
+    return k::cgen::builder.CreateUIToFP(c, llvm::Type::getDoubleTy(k::cgen::ctx), "booltmp");
+  }
+  default:
+    return k::cgen::log_error_v("invalid binary op");
+  }
+}
+llvm::Value * k::ast::call_expr::codegen() {
+  auto * callee = k::cgen::mod.getFunction(m_callee);
+  if (!callee) return k::cgen::log_error_v("unknown function referenced");
+  if (callee->arg_size() != m_args.size()) return k::cgen::log_error_v("incorrect number of arguments passed");
+
+  std::vector<llvm::Value *> args;
+  for (unsigned i = 0, e = m_args.size(); i != e; ++i) {
+    args.push_back(m_args[i]->codegen());
+    if (!args.back()) return nullptr;
+  }
+
+  return k::cgen::builder.CreateCall(callee, args, "calltmp");
+}
+
+llvm::Function * k::ast::prototype::codegen() {
+  auto * dt = llvm::Type::getDoubleTy(k::cgen::ctx);
+  std::vector<llvm::Type *> dbls { m_args.size(), dt };
+  llvm::FunctionType * ft = llvm::FunctionType::get(dt, dbls, false);
+  llvm::Function * f = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, m_name, k::cgen::mod);
+
+  unsigned idx = 0;
+  for (auto & arg : f->args()) {
+    arg.setName(m_args[idx++]);
+  }
+
+  return f;
+}
+llvm::Function * k::ast::function::codegen() {
+  auto * f = k::cgen::mod.getFunction(m_proto->name());
+  if (!f) f = m_proto->codegen();
+  if (!f) return nullptr;
+  if (!f->empty()) return k::cgen::log_error_f("function can't be redefined");
+
+  auto * bb = llvm::BasicBlock::Create(k::cgen::ctx, "entry", f);
+  k::cgen::builder.SetInsertPoint(bb);
+
+  k::cgen::scope.clear();
+  for (auto & arg : f->args()) {
+    k::cgen::scope[arg.getName().str()] = &arg;
+  }
+
+  if (llvm::Value * ret = m_body->codegen()) {
+    k::cgen::builder.CreateRet(ret);
+    llvm::verifyFunction(*f);
+    k::cgen::fpm.run(*f);
+    k::cgen::pm.run(k::cgen::mod);
+    return f;
+  }
+
+  f->eraseFromParent();
+  return nullptr;
+}
 
 int main() {
+  k::cgen::setup_fpm();
+
   k::ast::main_loop();
+  k::cgen::mod.print(llvm::errs(), nullptr);
 }
