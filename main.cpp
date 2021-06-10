@@ -1,11 +1,22 @@
+#include "llvm/ADT/APInt.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constant.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Value.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/IPO.h"
+#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+
 #include <cctype>
+#include <fstream>
 #include <iostream>
-#include <llvm/IR/IRBuilder.h>
-#include <llvm/IR/LegacyPassManager.h>
-#include <llvm/IR/Value.h>
-#include <llvm/IR/Verifier.h>
-#include <llvm/Transforms/IPO.h>
-#include <llvm/Transforms/IPO/PassManagerBuilder.h>
 #include <map>
 #include <memory>
 #include <string>
@@ -27,14 +38,18 @@ namespace k {
 
   static int last_char = ' ';
 
+  static std::ifstream in;
+  static int get_char() {
+    return in.eof() ? EOF : in.get();
+  }
   static int get_tok() {
     while (std::isspace(last_char)) {
-      last_char = getchar();
+      last_char = get_char();
     }
 
     if (std::isalpha(last_char)) {
       identifier_str = last_char;
-      while (std::isalnum((last_char = getchar()))) {
+      while (std::isalnum((last_char = get_char()))) {
         identifier_str += last_char;
       }
 
@@ -47,7 +62,7 @@ namespace k {
       std::string num_str;
       do {
         num_str += last_char;
-        last_char = getchar();
+        last_char = get_char();
       } while (std::isdigit(last_char) || last_char == '.');
 
       num_val = strtod(num_str.c_str(), nullptr);
@@ -56,7 +71,7 @@ namespace k {
 
     if (last_char == '#') {
       do {
-        last_char = getchar();
+        last_char = get_char();
       } while (last_char != EOF && last_char != '\n' && last_char != '\r');
 
       if (last_char != EOF) return get_tok();
@@ -67,7 +82,7 @@ namespace k {
     }
 
     int this_char = last_char;
-    last_char = getchar();
+    last_char = get_char();
     return this_char;
   }
 
@@ -306,45 +321,35 @@ namespace k::ast {
 
   static void handle_definition() {
     if (auto fn = parse_definition()) {
-      if (auto ir = fn->codegen()) {
-        ir->print(llvm::errs());
-        std::cerr << "\n";
-      }
+      fn->codegen();
     } else {
       get_next_token();
     }
   }
   static void handle_extern() {
     if (auto fn = parse_extern()) {
-      if (auto ir = fn->codegen()) {
-        ir->print(llvm::errs());
-        std::cerr << "\n";
-      }
+      fn->codegen();
     } else {
       get_next_token();
     }
   }
-  static void handle_top_level_expr() {
+  static llvm::Function * handle_top_level_expr() {
     if (auto e = parse_top_level_expr()) {
-      if (auto ir = e->codegen()) {
-        ir->print(llvm::errs());
-        std::cerr << "\n";
-        ir->eraseFromParent();
-      }
+      return e->codegen();
     } else {
       get_next_token();
+      return nullptr;
     }
   }
-  static void main_loop() {
-    std::cerr << "ready> ";
+  static auto main_loop() {
     get_next_token();
 
+    std::vector<llvm::Function *> top_levels;
     while (1) {
       switch (cur_tok) {
       case tok_eof:
-        return;
+        return top_levels;
       case ';': // ignore top-level semicolons
-        std::cerr << "ready> ";
         get_next_token();
         break;
       case tok_def:
@@ -354,7 +359,7 @@ namespace k::ast {
         handle_extern();
         break;
       default:
-        handle_top_level_expr();
+        top_levels.push_back(handle_top_level_expr());
         break;
       }
     }
@@ -364,8 +369,6 @@ namespace k::cgen {
   static llvm::LLVMContext ctx {};
   static llvm::IRBuilder<> builder { ctx };
   static llvm::Module mod { "k jit", ctx };
-  static llvm::legacy::PassManager pm;
-  static llvm::legacy::FunctionPassManager fpm { &mod };
   static std::map<std::string, llvm::Value *> scope;
 
   static llvm::Function * log_error_f(const char * str) {
@@ -375,18 +378,6 @@ namespace k::cgen {
   static llvm::Value * log_error_v(const char * str) {
     std::cerr << str << "\n";
     return nullptr;
-  }
-
-  static void setup_fpm() {
-    llvm::PassManagerBuilder b;
-    b.OptLevel = 3;
-    b.SizeLevel = 0;
-    b.Inliner = llvm::createFunctionInliningPass(3, 0, false);
-    b.populateFunctionPassManager(fpm);
-    b.populateModulePassManager(pm);
-
-    pm.add(llvm::createVerifierPass());
-    fpm.doInitialization();
   }
 }
 
@@ -438,7 +429,7 @@ llvm::Function * k::ast::prototype::codegen() {
   auto * dt = llvm::Type::getDoubleTy(k::cgen::ctx);
   std::vector<llvm::Type *> dbls { m_args.size(), dt };
   llvm::FunctionType * ft = llvm::FunctionType::get(dt, dbls, false);
-  llvm::Function * f = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, m_name, k::cgen::mod);
+  llvm::Function * f = llvm::Function::Create(ft, llvm::Function::InternalLinkage, m_name, k::cgen::mod);
 
   unsigned idx = 0;
   for (auto & arg : f->args()) {
@@ -464,8 +455,6 @@ llvm::Function * k::ast::function::codegen() {
   if (llvm::Value * ret = m_body->codegen()) {
     k::cgen::builder.CreateRet(ret);
     llvm::verifyFunction(*f);
-    k::cgen::fpm.run(*f);
-    k::cgen::pm.run(k::cgen::mod);
     return f;
   }
 
@@ -473,9 +462,50 @@ llvm::Function * k::ast::function::codegen() {
   return nullptr;
 }
 
-int main() {
-  k::cgen::setup_fpm();
+static llvm::cl::opt<std::string> in_file(llvm::cl::Positional, llvm::cl::desc("<input k>"));
+static llvm::cl::opt<std::string> out_file("o", llvm::cl::desc("<output filename>"), llvm::cl::value_desc("filename"));
 
-  k::ast::main_loop();
-  k::cgen::mod.print(llvm::errs(), nullptr);
+static auto create_printf() {
+  auto & c = k::cgen::ctx;
+  auto args = std::vector<llvm::Type *> { llvm::Type::getInt8PtrTy(c) };
+  auto ret = llvm::Type::getInt32Ty(c);
+  auto fnt = llvm::FunctionType::get(ret, args, true);
+  return llvm::Function::Create(fnt, llvm::Function::ExternalLinkage, "printf", k::cgen::mod);
+}
+static auto create_main() {
+  auto & c = k::cgen::ctx;
+  auto ret = llvm::Type::getInt32Ty(c);
+  auto fnt = llvm::FunctionType::get(ret, false);
+  return llvm::Function::Create(fnt, llvm::Function::ExternalLinkage, "main", k::cgen::mod);
+}
+int main(int argc, char ** argv) {
+  llvm::cl::ParseCommandLineOptions(argc, argv, "kaleidoscope\n");
+  if (in_file == "") {
+    llvm::errs() << "No input file\n";
+    return 1;
+  }
+  k::in = std::ifstream(in_file);
+
+  auto fmt = k::cgen::builder.CreateGlobalStringPtr("%f\n", "tlfmt", 0, &k::cgen::mod);
+  auto pf = create_printf();
+  auto m = create_main();
+  auto bb = llvm::BasicBlock::Create(k::cgen::ctx, "entry", m);
+  auto & b = k::cgen::builder;
+  for (auto top : k::ast::main_loop()) {
+    b.SetInsertPoint(bb);
+
+    auto tres = b.CreateCall(top);
+
+    std::vector<llvm::Value *> args { fmt, tres };
+    b.CreateCall(pf, args);
+  }
+  b.CreateRet(llvm::ConstantInt::get(k::cgen::ctx, llvm::APInt(32, 0)));
+
+  if (out_file == "") {
+    k::cgen::mod.print(llvm::outs(), nullptr);
+  } else {
+    std::error_code ec;
+    llvm::raw_fd_ostream out(out_file, ec, llvm::sys::fs::OF_None);
+    llvm::WriteBitcodeToFile(k::cgen::mod, out);
+  }
 }
